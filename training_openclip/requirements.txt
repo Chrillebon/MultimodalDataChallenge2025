@@ -1,0 +1,9 @@
+torch
+torchvision
+lightning
+black
+timm 
+albumentations
+scikit-learn
+pandas
+open_clip_torch
