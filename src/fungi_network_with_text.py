@@ -20,6 +20,7 @@ import time
 import csv
 from collections import Counter
 import pandas as pd
+import pickle as pkl
 
 def ensure_folder(folder):
     """
@@ -39,6 +40,30 @@ def seed_torch(seed=777):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
+
+with open("../lookup/text_embeddings_dictionary.pkl", "rb") as f:
+    lookup = pkl.load(f)
+
+
+# --- add near top ---
+def get_text_clip_embedding(lookup, habitat, substrate, text=None, d_text=512):
+    """
+    lookup: dict mapping either text OR (habitat, substrate) -> np.ndarray float32[D]
+    If 'text' is supplied and present in lookup, that key is preferred.
+    Fallback: zeros if not found or missing.
+    """
+    if text is not None and text in lookup:
+        v = lookup[text]
+    elif (habitat, substrate) in lookup:
+        v = lookup[(habitat, substrate)]
+    else:
+        v = None
+    if v is None:
+        return np.zeros(d_text, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    # (optional but helpful) L2-normalize CLIP embeddings
+    n = np.linalg.norm(v) + 1e-8
+    return (v / n).astype(np.float32)
 
 
 def create_text_from_habitat_and_substrate(habitat, substrate):
@@ -89,46 +114,79 @@ def get_transforms(data):
     else:
         raise ValueError("Unknown data mode requested (only 'train' or 'valid' allowed).")
 
-
 class FungiDataset(Dataset):
-    def __init__(self, df, path, transform=None, full_data = True):
-
+    def __init__(self, df, path, transform=None, full_data=True, text_lookup=None, d_text=512):
         if full_data == False:
-            df = df.dropna().reset_index(drop = True) # NOTE: this assumes that we've bought ALL data for the training set
-        self.df = df
+            df = df.dropna().reset_index(drop=True)
+        self.df = df.reset_index(drop=True)
         self.transform = transform
         self.path = path
+        self.text_lookup = text_lookup or {}   # dict
+        self.d_text = d_text
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        file_path = self.df["filename_index"].values[idx]
-        # Get label if it exists; otherwise return None
-        label = self.df["taxonID_index"].values[idx]  # Get label
+        row = self.df.iloc[idx]
+        file_path = row["filename_index"]
+        label = row["taxonID_index"]
+        label = -1 if pd.isnull(label) else int(label)
 
-        
-        if pd.isnull(label):
-            label = -1  # Handle missing labels for the test dataset
-        else:
-            label = int(label)
-
-        with Image.open(join(self.path, file_path)) as img:
-            # Convert to RGB mode (handles grayscale images as well)
+        with Image.open(os.path.join(self.path, file_path)) as img:
             image = img.convert("RGB")
         image = np.array(image)
-
-        # Apply transformations if available
         if self.transform:
-            augmented = self.transform(image=image)
-            image = augmented["image"]
+            image = self.transform(image=image)["image"]
 
-        habitat = self.df["Habitat"].values[idx]
-        substrate = self.df["Substrate"].values[idx]
-
+        # Build text and fetch CLIP embedding
+        habitat = row.get("Habitat", None)
+        substrate = row.get("Substrate", None)
         text = create_text_from_habitat_and_substrate(habitat=habitat, substrate=substrate)
+        text_vec = get_text_clip_embedding(self.text_lookup, habitat, substrate, text=text, d_text=self.d_text)
+        text_vec = torch.from_numpy(text_vec)   # FloatTensor [D_text]
 
-        return image, label, file_path, text
+        return image, text_vec, label, file_path
+    
+class TextBranch(nn.Module):
+    def __init__(self, d_text, out_dim=128, p=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_text, 256), nn.ReLU(), nn.Dropout(p),
+            nn.Linear(256, out_dim), nn.ReLU(), nn.Dropout(p),
+        )
+        self.out_dim = out_dim
+    def forward(self, x): return self.net(x)
+
+class EffNetTextFusion(nn.Module):
+    def __init__(self, n_classes, d_text=512, img_backbone='efficientnet_b0'):
+        super().__init__()
+        # Image backbone -> embedding
+        self.backbone = getattr(models, img_backbone)(pretrained=True)
+        feat_dim = self.backbone.classifier[1].in_features  # 1280 for b0
+        # turn classifier into embedding head
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(inplace=True)
+        )
+        # Text branch
+        self.text = TextBranch(d_text=d_text, out_dim=128, p=0.2)
+        # Projectors for a cheap interaction (Hadamard)
+        self.proj_img = nn.Linear(feat_dim, 128)
+        # Classifier
+        fused_dim = feat_dim + self.text.out_dim + 128  # + interaction
+        self.cls = nn.Sequential(
+            nn.Linear(fused_dim, 512), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(512, n_classes)
+        )
+
+    def forward(self, images, text_vec):
+        img_emb = self.backbone(images)      # [B, 1280]
+        txt_emb = self.text(text_vec)        # [B, 128]
+        inter   = self.proj_img(img_emb) * txt_emb   # [B, 128]
+        x = torch.cat([img_emb, txt_emb, inter], dim=1)
+        return self.cls(x)
 
 def train_fungi_network(data_file, image_path, checkpoint_dir):
     """
@@ -150,18 +208,32 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
     print('Validation size', len(val_df))
 
     # Initialize DataLoaders
-    train_dataset = FungiDataset(train_df, image_path, transform=get_transforms(data='train'))
-    valid_dataset = FungiDataset(val_df, image_path, transform=get_transforms(data='valid'))
+    #train_dataset = FungiDataset(train_df, image_path, transform=get_transforms(data='train'))
+    #valid_dataset = FungiDataset(val_df, image_path, transform=get_transforms(data='valid'))
+    #train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    #valid_loader = DataLoader(valid_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+    D_TEXT = next(iter(text_lookup.values())).shape[0] if len(text_lookup) else 512
+
+    train_dataset = FungiDataset(train_df, image_path, transform=get_transforms('train'),
+                                text_lookup=lookup, d_text=D_TEXT)
+    valid_dataset = FungiDataset(val_df, image_path, transform=get_transforms('valid'),
+                                text_lookup=lookup, d_text=D_TEXT)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
     valid_loader = DataLoader(valid_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-    # Network Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = models.efficientnet_b0(pretrained=True)
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.2),
-        nn.Linear(model.classifier[1].in_features, len(train_df['taxonID_index'].unique()))
-    )
+    n_classes = train_df['taxonID_index'].nunique()
+    model = EffNetTextFusion(n_classes=n_classes, d_text=D_TEXT).to(device)
+    
+
+    # Network Setup
+    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #model = models.efficientnet_b0(pretrained=True)
+    #model.classifier = nn.Sequential(
+    #    nn.Dropout(0.2),
+    #    nn.Linear(model.classifier[1].in_features, len(train_df['taxonID_index'].unique()))
+    #)
     model.to(device)
 
     # Define Optimization, Scheduler, and Criterion
@@ -186,10 +258,10 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
         epoch_start_time = time.time()
         
         # Training Loop
-        for images, labels, _ in train_loader:
-            images, labels = images.to(device), labels.to(device)
+        for images, text_vec, labels, _ in train_loader:
+            images, text_vec, labels = images.to(device), text_vec.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(images)
+            outputs = model(images, text_vec)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
@@ -211,9 +283,9 @@ def train_fungi_network(data_file, image_path, checkpoint_dir):
         
         # Validation Loop
         with torch.no_grad():
-            for images, labels, _ in valid_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
+            for images, text_vec, labels, _ in valid_loader:
+                images, text_vec, labels = images.to(device), text_vec.to(device), labels.to(device)
+                outputs = model(images, text_vec)
                 val_loss += criterion(outputs, labels).item()
                 
                 # Calculate validation accuracy

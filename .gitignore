@@ -159,7 +159,7 @@ cython_debug/
 .idea
 
 # input data, saved log, checkpoints
-# data/
+data/
 # input/
 # saved/
 # datasets/
@@ -172,4 +172,7 @@ __MACOSX/
 # Rasmus stuff
 *_RAPADEBUG*
 
-
+*/*.ckpt
+*/lightning_logs
+*/*.csv
+minimal_test/
