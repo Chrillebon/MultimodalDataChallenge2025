@@ -29,9 +29,9 @@ def get_transforms(data):
         return Compose(
             [
                 RandomResizedCrop((width, height), scale=(0.8, 1.0)),
-                HorizontalFlip(p=0.5),
+                # HorizontalFlip(p=0.5),
                 VerticalFlip(p=0.5),
-                RandomBrightnessContrast(p=0.2),
+                RandomBrightnessContrast(p=0.1),
                 Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2(),
             ]

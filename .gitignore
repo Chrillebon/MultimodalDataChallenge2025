@@ -172,7 +172,8 @@ __MACOSX/
 # Rasmus stuff
 *_RAPADEBUG*
 
-*/*.ckpt
-*/lightning_logs
-*/*.csv
+**/*.ckpt
+**/lightning_logs
+**/*.csv
 minimal_test/
+**/*.pth
