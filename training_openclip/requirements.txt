@@ -7,3 +7,4 @@ albumentations
 scikit-learn
 pandas
 open_clip_torch
+pyproj

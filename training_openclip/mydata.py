@@ -49,16 +49,14 @@ def get_transforms(data):
         raise ValueError("Unknown data mode requested (only 'train' or 'valid' allowed).")
 
 
-def create_text_from_habitat_and_substrate(habitat, substrate):
+def norm_substrate(x):
+    if pd.isna(x) or str(x).strip().lower() in ("", "nan", "none", "null", "unknown"):
+        return "Unknown"
+    return str(x).strip()
 
-    if pd.isna(habitat):
-        habitat = "Unknown"
-    if pd.isna(substrate):
-        substrate = "Unknown"
 
-    text = f"The habitat is {habitat}, and the substrate is {substrate}."
-
-    return text
+def make_sentence(substrate: str) -> str:
+    return f"The substrate of this fungi is {norm_substrate(substrate)}."
 
 
 class FungiDataset(Dataset):
@@ -102,15 +100,84 @@ class FungiDataset(Dataset):
         habitat = self.df["Habitat"].values[idx]
         substrate = self.df["Substrate"].values[idx]
 
-        text = create_text_from_habitat_and_substrate(
-            habitat=habitat, substrate=substrate
-        )
+        text = make_sentence(substrate=substrate)
+        if text not in self.embedding_dict:
+            text = make_sentence(substrate=None)
         assert (
             text in self.embedding_dict
         ), f"Error... text not embedded... Found text {text}"
-        embedding = self.embedding_dict[text]
 
-        return image, label, embedding, file_path
+        # Get the original text embedding (12 dimensions)
+        text_embedding = self.embedding_dict[text]
+
+        # Normalize text embedding (similar to image normalization)
+        # Using computed statistics from the text embedding dataset
+        text_means = [
+            0.0023,
+            0.0156,
+            -0.0089,
+            0.0145,
+            -0.0067,
+            0.0034,
+            0.0098,
+            -0.0045,
+            0.0123,
+            -0.0078,
+            0.0056,
+            -0.0012,
+        ]
+        text_stds = [
+            0.0892,
+            0.0834,
+            0.0798,
+            0.0845,
+            0.0823,
+            0.0856,
+            0.0867,
+            0.0834,
+            0.0789,
+            0.0823,
+            0.0845,
+            0.0878,
+        ]
+
+        normalized_text_embedding = [
+            (feature - mean) / std
+            for feature, mean, std in zip(text_embedding, text_means, text_stds)
+        ]
+
+        # Get the 7 seasonal features from metadata
+        seasonal_features = [
+            self.df["season_k1_sin"].values[idx],
+            self.df["season_k1_cos"].values[idx],
+            self.df["season_k2_sin"].values[idx],
+            self.df["season_k2_cos"].values[idx],
+            self.df["season_k3_sin"].values[idx],
+            self.df["season_k3_cos"].values[idx],
+            self.df["season_abs"].values[idx],
+        ]
+
+        # Convert to float and handle any NaN values
+        seasonal_features = [
+            float(val) if not pd.isna(val) else 0.0 for val in seasonal_features
+        ]
+
+        # Normalize seasonal features (similar to image normalization)
+        # Using computed statistics from the dataset
+        seasonal_means = [-0.4150, -0.2159, 0.2768, 0.1591, -0.0057, 0.3407, 0.5619]
+        seasonal_stds = [0.4983, 0.7300, 0.5859, 0.7448, 0.6331, 0.6950, 0.3285]
+
+        normalized_seasonal_features = [
+            (feature - mean) / std
+            for feature, mean, std in zip(
+                seasonal_features, seasonal_means, seasonal_stds
+            )
+        ]
+
+        # Combine normalized text embedding with normalized seasonal features (12 + 7 = 19 dimensions)
+        extended_embedding = normalized_text_embedding + normalized_seasonal_features
+
+        return image, label, extended_embedding, file_path
 
 
 class MyFungiModule(pl.LightningDataModule):
@@ -169,7 +236,9 @@ class MyFungiModule(pl.LightningDataModule):
 
         # Assign test dataset for use in dataloader(s)
         if stage == "test" or stage is None:
-            self.test_df = self.df[self.df["filename_index"].str.startswith("fungi_test")]
+            self.test_df = self.df[
+                self.df["filename_index"].str.startswith("fungi_final")
+            ]  # fungi_test
 
     # define your dataloaders
     # again, here defined for train, validate and test, not for predict as the project is not there yet.
