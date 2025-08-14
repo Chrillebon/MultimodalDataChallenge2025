@@ -1,26 +1,34 @@
-import torch
-import pytorch_lightning as pl
-from torch.utils.data import DataLoader
-from open_clip import create_model_and_transforms, tokenize
+import csv
 import os
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
-from albumentations import Compose, Normalize, Resize
+
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import tqdm
 from albumentations import (
-    RandomResizedCrop,
+    Compose,
     HorizontalFlip,
-    VerticalFlip,
+    Normalize,
     RandomBrightnessContrast,
+    RandomResizedCrop,
+    Resize,
+    VerticalFlip,
 )
 from albumentations.pytorch import ToTensorV2
+from mydata import (
+    FungiDataset,
+    MyFungiModule,
+    create_text_from_habitat_and_substrate,
+)  # Example data module
+
+# from torch.utils.data import DataLoader
+from open_clip import create_model_and_transforms, tokenize
+from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchmetrics import F1Score
-import tqdm
-import csv
-import pandas as pd
 from torchvision import models
-
-import torch.nn as nn
-from mydata import MyFungiModule  # Example data module
 
 
 class SeparateWeightsSaveCallback(Callback):
@@ -91,12 +99,14 @@ class OpenCLIPViTLightning(pl.LightningModule):
         lr=1e-4,
         train_image_encoder=True,
         use_efficientnet=False,  # New flag to use EfficientNet instead of CLIP ViT
+        embedding_dim=12,  # Dimension of the embeddings to concatenate with image features
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.train_image_encoder = train_image_encoder
         self.use_efficientnet = use_efficientnet
+        self.embedding_dim = embedding_dim
 
         if use_efficientnet:
             # Use EfficientNet-B0 as image encoder
@@ -149,20 +159,23 @@ class OpenCLIPViTLightning(pl.LightningModule):
         for param in self.text_encoder.parameters():
             param.requires_grad = False
 
-        # # Calculate hidden layer size
-        # hidden_dim = feature_dim // 2  # Hidden layer: half of input features
+        # Calculate hidden layer size
+        combined_features_dim = (
+            feature_dim + self.embedding_dim
+        )  # Image features + embeddings
+        hidden_dim = combined_features_dim // 2  # Hidden layer: half of combined features
 
-        # self.classifier = nn.Sequential(
-        #     nn.Dropout(0.2),
-        #     nn.Linear(feature_dim, hidden_dim),
-        #     nn.ReLU(),
-        #     nn.Dropout(0.3),
-        #     nn.Linear(hidden_dim, num_classes),
-        # )
         self.classifier = nn.Sequential(
             nn.Dropout(0.2),
-            nn.Linear(feature_dim, num_classes),
+            nn.Linear(combined_features_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, num_classes),
         )
+        # self.classifier = nn.Sequential(
+        #     nn.Dropout(0.2),
+        #     nn.Linear(feature_dim, num_classes),
+        # )
 
         # Initialize F1Score metrics for training and validation
         self.train_f1 = F1Score(
@@ -224,10 +237,33 @@ class OpenCLIPViTLightning(pl.LightningModule):
         return image_features, text_features
 
     def training_step(self, batch, batch_idx):
-        images, labels, file_paths = batch
+        images, labels, embedding, file_paths = batch
+        # Ensure embedding is a tensor and on the correct device
+        if not isinstance(embedding, torch.Tensor):
+            # If embedding is a list of tensors, stack them
+            if (
+                isinstance(embedding, list)
+                and len(embedding) > 0
+                and isinstance(embedding[0], torch.Tensor)
+            ):
+                embedding = torch.stack(embedding).T
+            else:
+                embedding = torch.tensor(embedding)
+        embedding = embedding.to(self.device, torch.float)
+
+        # # Flatten embedding if it has more than 2 dimensions
+        # if embedding.dim() > 2:
+        #     embedding = embedding.flatten(start_dim=1)
+        # elif embedding.dim() == 1:
+        #     embedding = embedding.unsqueeze(0)
+
         # For CLIP training without text, we'll use image features for classification
         image_features = self.image_encoder(images)
-        logits = self.classifier(image_features)
+
+        # Concatenate image features with embeddings
+        combined_features = torch.cat([image_features, embedding], dim=1)
+
+        logits = self.classifier(combined_features)
         loss = self.loss_fn(logits, labels)
 
         # Calculate training accuracy
@@ -244,9 +280,33 @@ class OpenCLIPViTLightning(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        images, labels, file_paths = batch
+        images, labels, embedding, file_paths = batch
+        # Ensure embedding is a tensor and on the correct device
+        if not isinstance(embedding, torch.Tensor):
+            # If embedding is a list of tensors, stack them
+            if (
+                isinstance(embedding, list)
+                and len(embedding) > 0
+                and isinstance(embedding[0], torch.Tensor)
+            ):
+                embedding = torch.stack(embedding).T
+            else:
+                embedding = torch.tensor(embedding)
+
+        embedding = embedding.to(self.device, torch.float)
+
+        # # Flatten embedding if it has more than 2 dimensions
+        # if embedding.dim() > 2:
+        #     embedding = embedding.flatten(start_dim=1)
+        # elif embedding.dim() == 1:
+        #     embedding = embedding.unsqueeze(0)
+
         image_features = self.image_encoder(images)
-        logits = self.classifier(image_features)
+
+        # Concatenate image features with embeddings
+        combined_features = torch.cat([image_features, embedding], dim=1)
+
+        logits = self.classifier(combined_features)
         loss = self.loss_fn(logits, labels)
 
         # Calculate accuracy
@@ -348,6 +408,7 @@ def evaluate_clip_network_on_test_set(
             lr=0.001,
             train_image_encoder=True,
             use_efficientnet=use_efficientnet,
+            embedding_dim=12,  # Make sure this matches your training embedding dimension
         )
         model.load_image_encoder_weights(image_encoder_path)
         model.load_classifier_weights(classifier_path)
@@ -360,6 +421,7 @@ def evaluate_clip_network_on_test_set(
             num_classes=data_module.num_classes,
             lr=0.001,
             use_efficientnet=use_efficientnet,
+            embedding_dim=12,  # Make sure this matches your training embedding dimension
         )
         print("Using untrained model (only pretrained weights)")
 
@@ -369,12 +431,68 @@ def evaluate_clip_network_on_test_set(
     # Collect Predictions
     results = []
     with torch.no_grad():
-        for images, labels, filenames in tqdm.tqdm(
-            test_loader, desc="Evaluating on test set"
-        ):
-            images = images.to(device)
-            image_features = model.image_encoder(images)
-            logits = model.classifier(image_features)
+        for batch in tqdm.tqdm(test_loader, desc="Evaluating on test set"):
+            if len(batch) == 4:
+                # Handle case with embeddings: images, labels, embeddings, file_paths
+                images, labels, embedding, file_paths = batch
+                images = images.to(device)
+                image_features = model.image_encoder(images)
+
+                # Ensure embedding is a tensor and on the correct device
+                if not isinstance(embedding, torch.Tensor):
+                    # If embedding is a list of tensors, stack them
+                    if (
+                        isinstance(embedding, list)
+                        and len(embedding) > 0
+                        and isinstance(embedding[0], torch.Tensor)
+                    ):
+                        embedding = torch.stack(embedding).T
+                    else:
+                        embedding = torch.tensor(embedding)
+                embedding = embedding.to(device, torch.float)
+                combined_features = torch.cat([image_features, embedding], dim=1)
+                logits = model.classifier(combined_features)
+
+                # Use the actual file paths from the batch
+                filenames = file_paths
+            elif len(batch) == 3:
+                # Handle case with embeddings but no file paths: images, labels, embeddings
+                images, labels, embedding = batch
+                images = images.to(device)
+                image_features = model.image_encoder(images)
+
+                # Ensure embedding is a tensor and on the correct device
+                if not isinstance(embedding, torch.Tensor):
+                    # If embedding is a list of tensors, stack them
+                    if (
+                        isinstance(embedding, list)
+                        and len(embedding) > 0
+                        and isinstance(embedding[0], torch.Tensor)
+                    ):
+                        embedding = torch.stack(embedding).T
+                    else:
+                        embedding = torch.tensor(embedding)
+                embedding = embedding.to(device, torch.float)
+                combined_features = torch.cat([image_features, embedding], dim=1)
+                logits = model.classifier(combined_features)
+
+                # Generate filenames as fallback
+                filenames = [f"sample_{i}" for i in range(len(images))]
+            else:
+                print("Did not load the test embeddings as was hoped...")
+                # Handle case without embeddings (fallback)
+                images, filenames = batch[0], batch[-1]
+                images = images.to(device)
+                image_features = model.image_encoder(images)
+                # For models expecting embeddings, we need to create dummy embeddings
+                # This should match the embedding dimension used in training
+                batch_size = images.shape[0]
+                dummy_embeddings = torch.zeros(batch_size, model.embedding_dim).to(
+                    device, torch.float
+                )
+                combined_features = torch.cat([image_features, dummy_embeddings], dim=1)
+                logits = model.classifier(combined_features)
+
             predictions = logits.argmax(1).cpu().numpy()
 
             # Store filenames and predictions
@@ -391,8 +509,172 @@ def evaluate_clip_network_on_test_set(
     return output_csv_path
 
 
+def evaluate_on_validation_set(
+    checkpoint_path,
+    image_encoder_path=None,
+    classifier_path=None,
+    use_efficientnet=False,
+):
+    """
+    Evaluate the trained model on the validation set and provide detailed class-wise metrics.
+    """
+    # Load data module and setup validation data
+    data_module = MyFungiModule()
+    data_module.setup(stage="fit")  # This sets up both train and val data
+    val_loader = data_module.val_dataloader()
+
+    # Load the trained model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        # Load from full checkpoint
+        model = OpenCLIPViTLightning.load_from_checkpoint(
+            checkpoint_path, num_classes=data_module.num_classes
+        )
+        print(f"Model loaded from checkpoint: {checkpoint_path}")
+    elif image_encoder_path is not None and classifier_path is not None:
+        # Load from separate weight files
+        model = OpenCLIPViTLightning(
+            model_name="ViT-B-32",
+            pretrained="openai",
+            num_classes=data_module.num_classes,
+            lr=0.001,
+            train_image_encoder=True,
+            use_efficientnet=use_efficientnet,
+            embedding_dim=12,  # Make sure this matches your training embedding dimension
+        )
+        model.load_image_encoder_weights(image_encoder_path)
+        model.load_classifier_weights(classifier_path)
+        print("Model loaded from separate weight files")
+    else:
+        print("No trained model found. Please provide valid model weights.")
+        return
+
+    model.to(device)
+    model.eval()
+
+    # Collect all predictions and true labels
+    all_predictions = []
+    all_labels = []
+
+    print("Evaluating on validation set...")
+    with torch.no_grad():
+        for batch in tqdm.tqdm(val_loader, desc="Processing validation batches"):
+            images, labels, embedding, file_paths = batch
+            images = images.to(device)
+
+            # Handle embeddings properly (same as in training/validation)
+            if not isinstance(embedding, torch.Tensor):
+                if (
+                    isinstance(embedding, list)
+                    and len(embedding) > 0
+                    and isinstance(embedding[0], torch.Tensor)
+                ):
+                    embedding = torch.stack(embedding).T
+                else:
+                    embedding = torch.tensor(embedding)
+            embedding = embedding.to(device, torch.float)
+
+            # Get predictions
+            image_features = model.image_encoder(images)
+            combined_features = torch.cat([image_features, embedding], dim=1)
+            logits = model.classifier(combined_features)
+            predictions = logits.argmax(1).cpu().numpy()
+
+            # Store predictions and labels
+            all_predictions.extend(predictions)
+            all_labels.extend(labels.cpu().numpy())
+
+    # Convert to numpy arrays for easier processing
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
+
+    # Calculate overall accuracy
+    overall_accuracy = (all_predictions == all_labels).mean()
+    print(f"\nOverall Validation Accuracy: {overall_accuracy:.4f}")
+
+    # Calculate class-wise metrics
+    num_classes = data_module.num_classes
+    class_results = []  # Store class results for sorting
+
+    print("\nClass-wise Results:")
+    print("=" * 60)
+    print(f"{'Class':<8} {'Count':<8} {'Correct':<8} {'Accuracy':<10}")
+    print("=" * 60)
+
+    for class_id in range(num_classes):
+        # Find instances of this class
+        class_mask = all_labels == class_id
+        class_count = class_mask.sum()
+
+        if class_count > 0:
+            # Calculate accuracy for this class
+            class_predictions = all_predictions[class_mask]
+            class_true_labels = all_labels[class_mask]
+            correct_predictions = (class_predictions == class_true_labels).sum()
+            class_accuracy = correct_predictions / class_count
+
+            # Store class results for sorting
+            class_results.append(
+                {
+                    "class_id": class_id,
+                    "count": class_count,
+                    "correct": correct_predictions,
+                    "accuracy": class_accuracy,
+                }
+            )
+
+    # Sort class results by accuracy (descending order - best first)
+    class_results.sort(key=lambda x: x["accuracy"], reverse=True)
+
+    # Display sorted results
+    class_accuracies = []
+    class_counts = []
+
+    for result in class_results:
+        class_accuracies.append(result["accuracy"])
+        class_counts.append(result["count"])
+
+        print(
+            f"{result['class_id']:<8} {result['count']:<8} {result['correct']:<8} {result['accuracy']:<10.4f}"
+        )
+
+    # Display classes with no samples
+    for class_id in range(num_classes):
+        class_mask = all_labels == class_id
+        class_count = class_mask.sum()
+        if class_count == 0:
+            print(f"{class_id:<8} {0:<8} {0:<8} {'N/A':<10}")
+
+    print("=" * 60)
+
+    # Calculate and display summary statistics
+    if class_accuracies:
+        mean_class_accuracy = np.mean(class_accuracies)
+        std_class_accuracy = np.std(class_accuracies)
+        min_class_accuracy = np.min(class_accuracies)
+        max_class_accuracy = np.max(class_accuracies)
+
+        print("\nSummary Statistics:")
+        print(
+            f"Mean class accuracy: {mean_class_accuracy:.4f} ± {std_class_accuracy:.4f}"
+        )
+        print(f"Min class accuracy: {min_class_accuracy:.4f}")
+        print(f"Max class accuracy: {max_class_accuracy:.4f}")
+        print(f"Total validation samples: {len(all_labels)}")
+        print(f"Classes with samples: {len(class_accuracies)}/{num_classes}")
+
+    return {
+        "overall_accuracy": overall_accuracy,
+        "class_accuracies": class_accuracies,
+        "class_counts": class_counts,
+        "predictions": all_predictions,
+        "labels": all_labels,
+    }
+
+
 if __name__ == "__main__":
-    run_mode = "test"  # "train" "test" "encode"
+    run_mode = "validate"  # "train" "test" "encode" "validate"
 
     if run_mode == "train":
         # Example usage with MyFungiModule (adapt as needed)
@@ -405,6 +687,7 @@ if __name__ == "__main__":
             lr=1e-3,
             train_image_encoder=True,  # Set to True to train the image encoder
             use_efficientnet=True,  # Set to True to use EfficientNet-B0 instead of CLIP ViT
+            embedding_dim=12,  # Dimension of embeddings from your data
         )
 
         # Directory for saving separate weights
@@ -495,6 +778,51 @@ if __name__ == "__main__":
             print("No trained model found. Please train the model first.")
             print(f"Looking for: {checkpoint_path}")
             print(f"Or separate files: {image_encoder_path} and {classifier_path}")
+    elif run_mode == "validate":
+        # Evaluate the best model on the validation set with detailed class-wise metrics
+        results_dir = (
+            "/zhome/c8/5/147202/summerschool25/MultimodalDataChallenge2025/results"
+        )
+        checkpoint_path = os.path.join(results_dir, "best_model_full.ckpt")
+
+        # Check for both CLIP ViT and EfficientNet weight files
+        image_encoder_path = os.path.join(results_dir, "image_encoder_weights.pth")
+        classifier_path = os.path.join(results_dir, "classifier_weights.pth")
+        efficientnet_encoder_path = os.path.join(
+            results_dir, "efficientnet_encoder_weights.pth"
+        )
+        efficientnet_classifier_path = os.path.join(
+            results_dir, "efficientnet_classifier_weights.pth"
+        )
+
+        if os.path.exists(checkpoint_path):
+            # Use the full checkpoint if available
+            print("Evaluating with full checkpoint...")
+            evaluate_on_validation_set(checkpoint_path)
+        elif os.path.exists(efficientnet_encoder_path) and os.path.exists(
+            efficientnet_classifier_path
+        ):
+            # Use EfficientNet separate weight files if available
+            print("Evaluating EfficientNet model from separate weight files...")
+            evaluate_on_validation_set(
+                None,
+                image_encoder_path=efficientnet_encoder_path,
+                classifier_path=efficientnet_classifier_path,
+                use_efficientnet=True,
+            )
+        elif os.path.exists(image_encoder_path) and os.path.exists(classifier_path):
+            # Use CLIP ViT separate weight files if available
+            print("Evaluating CLIP ViT model from separate weight files...")
+            evaluate_on_validation_set(
+                None,
+                image_encoder_path=image_encoder_path,
+                classifier_path=classifier_path,
+                use_efficientnet=False,
+            )
+        else:
+            print("No trained model found. Please train the model first.")
+            print(f"Looking for: {checkpoint_path}")
+            print(f"Or separate files: {image_encoder_path} and {classifier_path}")
     elif run_mode == "encode":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -503,7 +831,12 @@ if __name__ == "__main__":
 
         df = pd.read_csv(file_path)
 
-        data = FungiDataset(df=df, path=image_path, full_data=False)
+        data = FungiDataset(
+            df=df,
+            path=image_path,
+            embedding_path="/zhome/c8/5/147202/summerschool25/MultimodalDataChallenge2025/lookup/text_embeddings_dictionary.json",
+            full_data=False,
+        )
 
         text2encode = data.df.apply(
             lambda x: create_text_from_habitat_and_substrate(
