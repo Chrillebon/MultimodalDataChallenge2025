@@ -383,7 +383,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir,
         total_train_samples = 0
         t0 = time.time()
 
-        for images, text_vec, season_vec, geo_vec, grid_idx, labels, _ in train_loader:
+        for images, text_vec, season_vec, geo_vec, grid_idx, labels, _ in tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1} [train]"):
             images = images.to(device)
             text_vec = text_vec.to(device)
             numeric_vec = torch.cat([season_vec, geo_vec], dim=1).to(device)
@@ -409,7 +409,7 @@ def train_fungi_network(data_file, image_path, checkpoint_dir,
         total_correct_val = 0
         total_val_samples = 0
         with torch.no_grad():
-            for images, text_vec, season_vec, geo_vec, grid_idx, labels, _ in valid_loader:
+            for images, text_vec, season_vec, geo_vec, grid_idx, labels, _ in tqdm.tqdm(valid_loader, desc=f"Epoch {epoch+1} [val]"):
                 images = images.to(device)
                 text_vec = text_vec.to(device)
                 numeric_vec = torch.cat([season_vec, geo_vec], dim=1).to(device)
@@ -480,17 +480,13 @@ def evaluate_network_on_test_set(data_file, image_path, checkpoint_dir, session_
     grid_vocab_sizes = [len(v) for v in grid_vocabs]
 
     # dataset/loader
-    test_dataset = FungiDataset(test_df, image_path, transform=get_transforms('valid'),
-                                text_lookup=text_lookup, d_text=D_TEXT,
-                                season_cols=SEASON_COLS, geo_cols=GEO_NUM_COLS,
-                                grid_cols=GRID_COLS, grid_vocabs=grid_vocabs)
+    test_dataset = FungiDataset(test_df, image_path, transform=get_transforms('valid'), text_lookup=text_lookup, d_text=D_TEXT, season_cols=SEASON_COLS, geo_cols=GEO_NUM_COLS, grid_cols=GRID_COLS, grid_vocabs=grid_vocabs)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
 
     # model
     n_classes = int(df['taxonID_index'].nunique())  # or fixed 183
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = EffNetFusion(n_classes=n_classes, d_text=D_TEXT, d_numeric=D_NUMERIC,
-                         grid_vocab_sizes=grid_vocab_sizes).to(device)
+    model = EffNetFusion(n_classes=n_classes, d_text=D_TEXT, d_numeric=D_NUMERIC, grid_vocab_sizes=grid_vocab_sizes).to(device)
     model.load_state_dict(torch.load(best_trained_model, map_location=device))
     model.eval()
 
